@@ -26,7 +26,7 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.ir import InsertionPoint
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import buffer_ops, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import buffer_ops, const_expr, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator
@@ -89,12 +89,24 @@ def create_wmma_gemm_module(
     grid_n = N // BLOCK_N
     is_bf16 = in_dtype == "bf16"
 
-    def _wmma_op(a_vec, b_vec, acc):
-        if is_bf16:
-            a_i16 = a_vec.bitcast(fx.Int16)
-            b_i16 = b_vec.bitcast(fx.Int16)
-            return rocdl.wmma_f32_16x16x16_bf16(acc.type, a_i16, b_i16, acc).result
-        return rocdl.wmma_f32_16x16x16_f16(acc.type, a_vec, b_vec, acc).result
+    # Workgroup-barrier asm. RDNA 4 / gfx12+ supports split barriers
+    # (s_barrier_signal/wait) and per-counter waits (s_wait_dscnt /
+    # s_wait_storecnt) which let the wave overlap memory waits with the
+    # barrier. RDNA 3 / 3.5 (gfx11 / gfx115x) only ship the single
+    # S_BARRIER + combined S_WAITCNT family — see
+    # docs/rdna35_research/01_isa_reference.md §5.1–5.2.
+    if gpu_arch.startswith("gfx12"):
+        _BARRIER_ASM = (
+            "s_wait_dscnt 0x0\n"
+            "s_wait_storecnt 0x0\n"
+            "s_barrier_signal -1\n"
+            "s_barrier_wait -1"
+        )
+    else:
+        _BARRIER_ASM = (
+            "s_waitcnt vmcnt(0) lgkmcnt(0)\n"
+            "s_barrier"
+        )
 
     elem_bytes = 2  # bf16/f16 are both 2 bytes
     allocator = SmemAllocator(None, arch=gpu_arch)
@@ -125,6 +137,91 @@ def create_wmma_gemm_module(
         lane16 = lane % 16
         klane = lane // 16
         base8 = klane * 8
+
+        # RDNA3/3.5 V_WMMA_F32_16X16X16_{F16,BF16} ("WMMA256bInsts") expects
+        # each wave32 lane to provide a 16-wide A/B operand. FlyDSL fragments
+        # carry only K/2 = 8 K-elements per lane (group 0 = K[0:8],
+        # group 1 = K[8:16]); the high half is pulled from lane^16 via
+        # ds_bpermute. C++/dialect-path equivalent:
+        #   lib/Dialect/FlyROCDL/RDNA3/MmaAtom.cpp::expandTo16WideWmma256
+        _lane_i32 = fx.Int32(lane)
+        _paired_byte_addr = (_lane_i32 ^ fx.Int32(16)) * fx.Int32(4)
+
+        def _expand_to_wmma256(v8):
+            """Concatenate <8 x T> self with <8 x T> from lane^16 to <16 x T>."""
+            src_dtype = v8.dtype
+            packed = v8.bitcast(fx.Int32)  # <4 x i32>
+            paired_words = []
+            # NOTE: must use range_constexpr (compile-time unroll), not bare
+            # range() — inside @flyc.kernel the AST rewriter turns range() into
+            # scf_range and `i` would become a runtime index value rather than
+            # a Python int, breaking vector.extract's static_position=[i].
+            for i in range_constexpr(4):
+                word_i32 = vector.extract(packed, static_position=[i])
+                paired_i32 = rocdl.ds_bpermute(
+                    fx.Int32.ir_type, _paired_byte_addr, word_i32
+                )
+                paired_words.append(paired_i32)
+            paired_packed = fx.Vector.from_elements(paired_words, fx.Int32)
+            paired_v8 = paired_packed.bitcast(src_dtype)
+            return v8.shuffle(paired_v8, list(range(16)))
+
+        # The lane-group bit `(lane & 16) != 0` distinguishes lane group 0
+        # (matrix lanes 0..15) from lane group 1 (mirror lanes 16..31). We
+        # need it as an i1/i32 to select between the two output reorder masks.
+        _is_upper_group_i32 = _lane_i32 & fx.Int32(16)
+
+        def _reorder_f32_acc(c8):
+            """Re-permute per-lane <8 x f32> WMMA accumulator to the kernel's
+            lane-local row-major fragment convention (mirrors
+            ``MmaAtom.cpp::reorderF32AccLaneValues``).
+
+            Without this, LLVM 23 ``rocdl.wmma.f32.16x16x16.{f16,bf16}`` returns
+            the f32 result in a lane-local order that differs from what the
+            kernel's store path expects, producing row-shuffled output.
+            """
+            # 1. Lane-local interleave: {0, 4, 1, 5, 2, 6, 3, 7}.
+            lane_local = c8.shuffle(c8, [0, 4, 1, 5, 2, 6, 3, 7])
+
+            # 2. Cross-lane bpermute on each i32 element from lane^16.
+            packed = lane_local.bitcast(fx.Int32)  # <8 x i32>
+            paired_words = []
+            for i in range_constexpr(8):
+                word_i32 = vector.extract(packed, static_position=[i])
+                paired_i32 = rocdl.ds_bpermute(
+                    fx.Int32.ir_type, _paired_byte_addr, word_i32
+                )
+                paired_words.append(paired_i32)
+            paired_packed = fx.Vector.from_elements(paired_words, fx.Int32)
+            paired_lane_local = paired_packed.bitcast(fx.Float32)  # <8 x f32>
+
+            # 3. Lane-group select between mask {0,8,2,10,4,12,6,14} (group 0)
+            #    and {9,1,11,3,13,5,15,7} (group 1, lane^16).
+            out_g0 = lane_local.shuffle(paired_lane_local, [0, 8, 2, 10, 4, 12, 6, 14])
+            out_g1 = lane_local.shuffle(paired_lane_local, [9, 1, 11, 3, 13, 5, 15, 7])
+            is_upper = _is_upper_group_i32 != fx.Int32(0)
+            # is_upper True (lane in 16..31) -> out_g1; else out_g0.
+            return is_upper.select(out_g1, out_g0)
+
+        def _wmma_op(a_vec, b_vec, acc):
+            a_wide = _expand_to_wmma256(a_vec)
+            b_wide = _expand_to_wmma256(b_vec)
+            # Convert kernel-convention C to WMMA-convention C (mirrors
+            # MmaAtom.cpp F32<-F16/F16 path: reorder^3 pre, reorder^1 post).
+            c_pre = _reorder_f32_acc(_reorder_f32_acc(_reorder_f32_acc(acc)))
+            # const_expr() flags `is_bf16` as a Python compile-time branch so
+            # the AST rewriter does not lower it into a runtime scf.if.
+            if const_expr(is_bf16):
+                a_i16 = a_wide.bitcast(fx.Int16)
+                b_i16 = b_wide.bitcast(fx.Int16)
+                res = rocdl.wmma_f32_16x16x16_bf16(
+                    acc.type, a_i16, b_i16, c_pre
+                ).result
+            else:
+                res = rocdl.wmma_f32_16x16x16_f16(
+                    acc.type, a_wide, b_wide, c_pre
+                ).result
+            return _reorder_f32_acc(res)
 
         # Swizzle workgroup mapping for L2 locality
         effective_group_m = min(group_m, grid_m)
@@ -239,7 +336,7 @@ def create_wmma_gemm_module(
             _llvm.inline_asm(
                 res=None,
                 operands_=[],
-                asm_string="s_wait_dscnt 0x0\ns_wait_storecnt 0x0\ns_barrier_signal -1\ns_barrier_wait -1",
+                asm_string=_BARRIER_ASM,
                 constraints="",
                 has_side_effects=True,
             )

@@ -39,12 +39,13 @@ ARCH = str(get_rocm_arch())
 
 def _requires_rdna4():
     # The kernel is named "rdna4 / WMMA wave32" but its raw `wmma_*_16x16x16_*`
-    # intrinsics are valid on every wave32 + WMMA chip — that includes RDNA 3
-    # (gfx110x) and RDNA 3.5 (gfx115x, e.g. Strix Point Radeon 890M / Halo /
-    # Krackan / Medusa) in addition to RDNA 4 (gfx120x). Relax the guard so
-    # gfx115x boxes can validate the existing raw-intrinsic path; a separate
-    # atom-based path for RDNA 3 / 3.5 lives in `kernels/rdna3_f16_gemm.py`
-    # and is exercised by `tests/kernels/test_rdna3_wmma_gemm.py`.
+    # F16 / BF16 intrinsics are valid on every wave32 + WMMA chip — that
+    # includes RDNA 3 (gfx110x) and RDNA 3.5 (gfx115x, e.g. Strix Point
+    # Radeon 890M / Halo / Krackan / Medusa) in addition to RDNA 4 (gfx120x).
+    # Relax the guard so gfx115x boxes can validate the existing raw-intrinsic
+    # path; a separate atom-based path for RDNA 3 / 3.5 lives in
+    # `kernels/rdna3_f16_gemm.py` and is exercised by
+    # `tests/kernels/test_rdna3_wmma_gemm.py`.
     if not (
         ARCH.startswith("gfx120")
         or ARCH.startswith("gfx115")
@@ -52,6 +53,19 @@ def _requires_rdna4():
     ):
         pytest.skip(
             f"RDNA WMMA GEMM requires gfx110x / gfx115x / gfx120x, got {ARCH}"
+        )
+
+
+def _requires_fp8_wmma():
+    # FP8 WMMA (V_WMMA_F32_16X16X16_FP8_FP8 family) is RDNA 4 only — gfx1200 /
+    # gfx1201. RDNA 3 / 3.5 (gfx110x / gfx115x) lack FP8 WMMA entirely (see
+    # docs/rdna35_research/01_isa_reference.md §"WMMA FP8"); attempting to
+    # compile the kernel there triggers an LLVM "Cannot select" abort. The
+    # CDNA-style gfx1250 also has no 16x16x16 FP8 WMMA (it only ships the
+    # 16x16x32 K-shape variants).
+    if not ARCH.startswith("gfx120"):
+        pytest.skip(
+            f"FP8 WMMA preshuffle GEMM requires gfx120x (RDNA4), got {ARCH}"
         )
 
 
@@ -183,7 +197,7 @@ def _run_fp8_gemm(M, N, K, tile_m=32, tile_n=None, tile_k=32):
 )
 def test_fp8_gemm_correctness(M, N, K):
     """Test FP8 preshuffle GEMM correctness."""
-    _requires_rdna4()
+    _requires_fp8_wmma()
     torch.manual_seed(42)
 
     C, C_ref = _run_fp8_gemm(M, N, K)
