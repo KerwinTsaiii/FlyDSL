@@ -359,8 +359,10 @@ Transforms Python control flow to MLIR ops at the AST level:
 |---|---|---|---|
 | `gfx942` | MI300A / MI300X | 64 KB | CDNA 3, primary development target |
 | `gfx950` | MI350 / MI355X | 160 KB | CDNA 4, larger LDS |
-| `gfx1201` | Radeon AI PRO R9700 | 64 KB | RDNA 4 |
-| `gfx1250` | MI450 | 320 KB | GFX12, wave32, WMMA, TDM ops |
+| `gfx110x` | RX 7900 XTX (gfx1100), RX 7800 XT (gfx1101), Phoenix (gfx1103) | 64 KB | RDNA 3, wave32, WMMA 16x16x16 (F16/BF16/IU8/IU4 only — `WMMA256bInsts` operand convention) |
+| `gfx115x` | Strix Point Radeon 890M (gfx1150), Strix Halo (gfx1151), Krackan (gfx1152), Medusa (gfx1153) | 64 KB | **RDNA 3.5** APU iGPUs, wave32, WMMA 16x16x16 (same set as gfx110x); see [`docs/rdna35_research/`](rdna35_research/) for the dedicated atom (`MmaOpRDNA3_WMMA`) |
+| `gfx1201` | Radeon AI PRO R9700 | 64 KB | RDNA 4, wave32, WMMA + FP8 + sparse SWMMAC + `ds_load_tr` (`WMMA128bInsts`) |
+| `gfx1250` | MI450 | 320 KB | GFX12.5, wave32, WMMA + TDM + scaled WMMA + FP8/FP4 |
 | `gfx90a` | MI250X | 64 KB | CDNA 2 (verified platform) |
 
 ---

@@ -38,8 +38,21 @@ ARCH = str(get_rocm_arch())
 
 
 def _requires_rdna4():
-    if not ARCH.startswith("gfx120"):
-        pytest.skip(f"RDNA4 GEMM requires gfx120x, got {ARCH}")
+    # The kernel is named "rdna4 / WMMA wave32" but its raw `wmma_*_16x16x16_*`
+    # intrinsics are valid on every wave32 + WMMA chip — that includes RDNA 3
+    # (gfx110x) and RDNA 3.5 (gfx115x, e.g. Strix Point Radeon 890M / Halo /
+    # Krackan / Medusa) in addition to RDNA 4 (gfx120x). Relax the guard so
+    # gfx115x boxes can validate the existing raw-intrinsic path; a separate
+    # atom-based path for RDNA 3 / 3.5 lives in `kernels/rdna3_f16_gemm.py`
+    # and is exercised by `tests/kernels/test_rdna3_wmma_gemm.py`.
+    if not (
+        ARCH.startswith("gfx120")
+        or ARCH.startswith("gfx115")
+        or ARCH.startswith("gfx110")
+    ):
+        pytest.skip(
+            f"RDNA WMMA GEMM requires gfx110x / gfx115x / gfx120x, got {ARCH}"
+        )
 
 
 # ── BF16/F16 GEMM ────────────────────────────────────────────────────────────

@@ -225,7 +225,19 @@ SMEM_CAPACITY_MAP = {
     "gfx942": 65536,    # MI300A / MI300X: 64KB LDS per CU
     # CDNA 4 (MI350 Series) - 160KB LDS per CU (key upgrade for CDNA4)
     "gfx950": 163840,   # MI300C / MI300X Enhanced Models: 64KB LDS per CU
-    "gfx1201": 65536,  # RDNA4: 64KB LDS per WGP
+    # ===================== AMD RDNA 3 Architectures (gfx110x desktop / mobile) =====================
+    # RDNA 3: 128KB LDS per WGP, 64KB max per work-group
+    "gfx1100": 65536,   # Navi 31 (RX 7900 XTX / W7900)
+    "gfx1101": 65536,   # Navi 32 (RX 7800 XT)
+    "gfx1102": 65536,   # Navi 33 (RX 7600)
+    "gfx1103": 65536,   # Phoenix APU
+    # ===================== AMD RDNA 3.5 Architectures (Strix Point APUs) =====================
+    # RDNA 3.5: 128KB LDS per WGP, 64KB max per work-group
+    "gfx1150": 65536,   # Strix Point: Radeon 890M (16 CUs)
+    "gfx1151": 65536,   # Strix Halo: Radeon 8060S
+    "gfx1152": 65536,   # Krackan Point: Radeon 860M / 840M
+    "gfx1153": 65536,   # Medusa Point: Radeon 820M
+    "gfx1201": 65536,   # RDNA4: 64KB LDS per WGP
     # GFX1250 (MI450 Series) - 320KB LDS (WGP$ unified, 5 × 64KB segments)
     "gfx1250": 327680,  # MI450: 320KB configurable as LDS
 }

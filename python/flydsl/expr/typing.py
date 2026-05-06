@@ -63,6 +63,12 @@ def default_f8_type() -> ir.Type:
 
     - gfx95* (MI350): FP8 E4M3FN (OCP)
     - gfx94* (MI300): FP8 E4M3FNUZ
+    - gfx12* (MI450 / RDNA4): FP8 E4M3FN (OCP)
+
+    RDNA 3 / RDNA 3.5 (gfx110* / gfx115*) does not have native FP8 hardware
+    (no V_CVT_F32_FP8 or related conversion ops, no FP8 WMMA). Returning a
+    silently-wrong fall-through type masks bugs, so we raise instead — kernels
+    that need FP8 on those targets must do explicit byte-level packing.
     """
     arch = ""
     try:
@@ -71,6 +77,13 @@ def default_f8_type() -> ir.Type:
         arch = ""
     if "gfx95" in arch or "gfx12" in arch:
         return Float8E4M3FN.ir_type
+    if arch.startswith("gfx110") or arch.startswith("gfx115"):
+        raise NotImplementedError(
+            f"FP8 is not natively supported on {arch} (RDNA 3 / 3.5); "
+            "no V_CVT_F32_FP8 / FP8 WMMA hardware is present. "
+            "Either pin to gfx950+/gfx12+ or implement software-emulated FP8 "
+            "via byte-level packing through F16/F32."
+        )
     return Float8E4M3FNUZ.ir_type
 
 
