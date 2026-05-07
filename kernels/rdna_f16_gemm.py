@@ -43,15 +43,69 @@ def create_wmma_gemm_module(
     in_dtype="bf16",
     out_dtype="bf16",
     *,
-    reg_m=4,  # M-repeats per warp
-    reg_n=4,  # N-repeats per warp
-    reg_k=2,  # K-steps per tile (32/16=2)
-    waves_m=2,  # warps in M dimension
-    waves_n=2,  # warps in N dimension
-    group_m=8,
-    a_k_pad=8,  # K-padding for A in LDS (bank conflict avoidance)
-    b_k_pad=8,  # K-padding for B in LDS
+    reg_m=None,  # M-repeats per warp
+    reg_n=None,  # N-repeats per warp
+    reg_k=None,  # K-steps per tile (32/16=2)
+    waves_m=None,  # warps in M dimension
+    waves_n=None,  # warps in N dimension
+    group_m=None,
+    a_k_pad=None,  # K-padding for A in LDS (bank conflict avoidance)
+    b_k_pad=None,  # K-padding for B in LDS
+    use_native_bf16_acc=False,  # Experimental path; disabled by default.
 ):
+    gpu_arch = get_rocm_arch()
+
+    # Generic fallback keeps existing behavior.
+    defaults = {
+        "reg_m": 4,
+        "reg_n": 4,
+        "reg_k": 2,
+        "waves_m": 2,
+        "waves_n": 2,
+        "group_m": 8,
+        "a_k_pad": 8,
+        "b_k_pad": 8,
+    }
+    if gpu_arch.startswith(("gfx115", "gfx110")):
+        # RDNA3/3.5 baseline keeps the mature 128x128x32 tile.
+        defaults.update(
+            {
+                "reg_m": 4,
+                "reg_n": 4,
+                "reg_k": 2,
+                "waves_m": 2,
+                "waves_n": 2,
+                "group_m": 8,
+                "a_k_pad": 8,
+                "b_k_pad": 8,
+            }
+        )
+        # For medium square tiles (e.g. 1024x1024), remap waves to 4x1 and
+        # increase group swizzle for better locality/launch efficiency.
+        if (
+            M * N >= 1024 * 1024
+            and M <= 1024
+            and N <= 1024
+            and M % (WMMA_M * 4 * 4) == 0
+            and N % (WMMA_N * 4 * 1) == 0
+        ):
+            defaults.update(
+                {
+                    "waves_m": 4,
+                    "waves_n": 1,
+                    "group_m": 16,
+                }
+            )
+
+    reg_m = defaults["reg_m"] if reg_m is None else reg_m
+    reg_n = defaults["reg_n"] if reg_n is None else reg_n
+    reg_k = defaults["reg_k"] if reg_k is None else reg_k
+    waves_m = defaults["waves_m"] if waves_m is None else waves_m
+    waves_n = defaults["waves_n"] if waves_n is None else waves_n
+    group_m = defaults["group_m"] if group_m is None else group_m
+    a_k_pad = defaults["a_k_pad"] if a_k_pad is None else a_k_pad
+    b_k_pad = defaults["b_k_pad"] if b_k_pad is None else b_k_pad
+
     BLOCK_M = WMMA_M * reg_m * waves_m  # 16*4*2 = 128
     BLOCK_N = WMMA_N * reg_n * waves_n  # 16*4*2 = 128
     BLOCK_K = WMMA_K * reg_k  # 16*2 = 32
@@ -76,8 +130,6 @@ def create_wmma_gemm_module(
     LDS_ONE_BUF = LDS_A_SIZE + LDS_B_SIZE  # 10240 elements = 20KB
     LDS_TOTAL = 2 * LDS_ONE_BUF  # 20480 elements = 40KB
 
-    gpu_arch = get_rocm_arch()
-
     assert M % BLOCK_M == 0
     assert N % BLOCK_N == 0
     assert K % BLOCK_K == 0
@@ -88,6 +140,8 @@ def create_wmma_gemm_module(
     grid_m = M // BLOCK_M
     grid_n = N // BLOCK_N
     is_bf16 = in_dtype == "bf16"
+    use_native_bf16_acc = bool(use_native_bf16_acc) and in_dtype == "bf16" and out_dtype == "bf16"
+    out_elem_bytes = 4 if out_dtype == "f32" else 2
 
     # Workgroup-barrier asm. RDNA 4 / gfx12+ supports split barriers
     # (s_barrier_signal/wait) and per-counter waits (s_wait_dscnt /
@@ -104,7 +158,9 @@ def create_wmma_gemm_module(
         )
     else:
         _BARRIER_ASM = (
-            "s_waitcnt vmcnt(0) lgkmcnt(0)\n"
+            # On gfx11/11.5, we only need LDS ordering + workgroup sync here.
+            # Waiting vmcnt(0) every iteration over-serializes global loads.
+            "s_waitcnt lgkmcnt(0)\n"
             "s_barrier"
         )
 
@@ -203,25 +259,44 @@ def create_wmma_gemm_module(
             # is_upper True (lane in 16..31) -> out_g1; else out_g0.
             return is_upper.select(out_g1, out_g0)
 
-        def _wmma_op(a_vec, b_vec, acc):
-            a_wide = _expand_to_wmma256(a_vec)
-            b_wide = _expand_to_wmma256(b_vec)
-            # Convert kernel-convention C to WMMA-convention C (mirrors
-            # MmaAtom.cpp F32<-F16/F16 path: reorder^3 pre, reorder^1 post).
-            c_pre = _reorder_f32_acc(_reorder_f32_acc(_reorder_f32_acc(acc)))
+        def _wmma_fma_expanded(a_wide, b_wide, acc_wmma):
+            """One WMMA FMA with expanded A/B operands.
+
+            `acc_wmma` stays in the native WMMA accumulator lane layout.
+            We only reorder once before global-store, not on every FMA.
+            """
+            # Fast path: BF16 native-accumulate WMMA (no f32 reorder pipeline).
+            # Keep this path only for bf16->bf16 to preserve predictable numerics
+            # for other output types.
+            if const_expr(use_native_bf16_acc):
+                a_i16 = a_wide.bitcast(fx.Int16)
+                b_i16 = b_wide.bitcast(fx.Int16)
+                c_i16_wide = _expand_to_wmma256(fx.Vector(acc_wmma)).bitcast(fx.Int16)
+                # In current runtime bindings this symbol is exposed as the
+                # underlying ODS op-builder (res, a, b, c) without explicit
+                # op_sel argument.
+                res_wide_i16 = rocdl.wmma_bf16_16x16x16_bf16(
+                    c_i16_wide.type, a_i16, b_i16, c_i16_wide
+                ).result
+                res_wide = fx.Vector(res_wide_i16)
+                res_lo_i16 = fx.Vector.from_elements(
+                    [res_wide[i] for i in range_constexpr(8)], fx.Int16
+                )
+                return res_lo_i16.bitcast(fx.BFloat16)
+
             # const_expr() flags `is_bf16` as a Python compile-time branch so
             # the AST rewriter does not lower it into a runtime scf.if.
             if const_expr(is_bf16):
                 a_i16 = a_wide.bitcast(fx.Int16)
                 b_i16 = b_wide.bitcast(fx.Int16)
                 res = rocdl.wmma_f32_16x16x16_bf16(
-                    acc.type, a_i16, b_i16, c_pre
+                    acc_wmma.type, a_i16, b_i16, acc_wmma
                 ).result
             else:
                 res = rocdl.wmma_f32_16x16x16_f16(
-                    acc.type, a_wide, b_wide, c_pre
+                    acc_wmma.type, a_wide, b_wide, acc_wmma
                 ).result
-            return _reorder_f32_acc(res)
+            return res
 
         # Swizzle workgroup mapping for L2 locality
         effective_group_m = min(group_m, grid_m)
@@ -348,16 +423,20 @@ def create_wmma_gemm_module(
             This keeps register pressure low: only 4 B + 1 A + 16 accs live.
             """
             new_accs = list(accs_in)
-            # Load all B operands for this K-step first
+            # Load all B operands for this K-step first, and expand once.
             b_vecs = _load_b_from_lds(rk, buf_offset)
+            b_wides = []
+            for rn in range_constexpr(reg_n):
+                b_wides.append(_expand_to_wmma256(b_vecs[rn]))
             # Then load A one at a time and do reg_n WMMAs per A
             for rm in range_constexpr(reg_m):
                 a_vec = _load_a_single_from_lds(rk, rm, buf_offset)
+                a_wide = _expand_to_wmma256(a_vec)
                 for rn in range_constexpr(reg_n):
                     idx = rm * reg_n + rn
-                    new_accs[idx] = _wmma_op(
-                        a_vec,
-                        b_vecs[rn],
+                    new_accs[idx] = _wmma_fma_expanded(
+                        a_wide,
+                        b_wides[rn],
                         new_accs[idx],
                     )
             return new_accs
@@ -370,9 +449,14 @@ def create_wmma_gemm_module(
             return lds_vec_ptr.load([lds_idx // 8])
 
         # ============================================================
-        # Initialize accumulators -- 4x4 = 16 accumulators
+        # Initialize accumulators -- 4x4 = 16 accumulators.
+        # Keep them in native WMMA layout throughout the main loop and only
+        # convert once before epilogue stores.
         # ============================================================
-        zero_acc = fx.full(8, 0.0, fx.Float32)
+        if const_expr(use_native_bf16_acc):
+            zero_acc = fx.full(8, 0.0, fx.BFloat16)
+        else:
+            zero_acc = fx.full(8, 0.0, fx.Float32)
         accs = [zero_acc for _ in range_constexpr(reg_m * reg_n)]
 
         # ============================================================
@@ -428,16 +512,27 @@ def create_wmma_gemm_module(
         for rm in range_constexpr(reg_m):
             for rn in range_constexpr(reg_n):
                 idx = rm * reg_n + rn
+                if const_expr(use_native_bf16_acc):
+                    acc_lane = accs[idx]
+                else:
+                    acc_lane = _reorder_f32_acc(accs[idx])
                 wmma_m_off = wave_m * (reg_m * WMMA_M) + 16 * rm
                 wmma_n_off = wave_n * (reg_n * WMMA_N) + 16 * rn
+                g_col = tile_n0 + wmma_n_off + lane16
+                c_out_elem_bytes = fx.Int32(out_elem_bytes)
+                c_row_stride_bytes = fx.Int32(N * out_elem_bytes)
+                row0 = tile_m0 + wmma_m_off + base8
+                col_byte_off = fx.Int32(g_col) * c_out_elem_bytes
+                byte_off = fx.Int32(row0) * c_row_stride_bytes + col_byte_off
                 for si in range_constexpr(8):
-                    g_row = tile_m0 + wmma_m_off + base8 + si
-                    g_col = tile_n0 + wmma_n_off + lane16
-                    val = accs[idx][si]
+                    val = acc_lane[si]
                     if const_expr(out_dtype == "bf16"):
-                        val = val.to(fx.BFloat16)
-                    elem_off = g_row * N + g_col
-                    buffer_ops.buffer_store(val, c_rsrc, elem_off)
+                        val = fx.BFloat16(val)
+                    elif const_expr(out_dtype == "f16"):
+                        val = fx.Float16(val)
+                    buffer_ops.buffer_store(val, c_rsrc, byte_off, offset_is_bytes=True)
+                    if const_expr(si != 7):
+                        byte_off = byte_off + c_row_stride_bytes
 
     # ── Host launcher ──────────────────────────────────────────────────────
     @flyc.jit
