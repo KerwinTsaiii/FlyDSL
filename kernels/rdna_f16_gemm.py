@@ -97,6 +97,105 @@ def create_wmma_gemm_module(
                 }
             )
 
+        # Long-K, narrow-to-mid N shapes are a frequent weak spot versus
+        # hipBLASLt on Strix Halo (e.g. 2048x3072x12288, 1024x4096x16384).
+        # Increasing K-padding is the most robust gain across this family.
+        if (
+            M >= 512
+            and M <= 4096
+            and N <= 4096
+            and K >= 8192
+        ):
+            defaults.update(
+                {
+                    "a_k_pad": 16,
+                    "b_k_pad": 16,
+                }
+            )
+
+        # M=256 is sensitive: broad medium/large N,K tiles usually benefit
+        # from higher K-padding, but the extremely deep-K tail (e.g. K=32768)
+        # does not. Keep the upper bound conservative.
+        if (
+            M == 256
+            and N >= 4096
+            and K >= 4096
+            and K <= 28672
+        ):
+            defaults.update(
+                {
+                    "a_k_pad": 16,
+                    "b_k_pad": 16,
+                }
+            )
+
+        # Inside the M=256 long-K band, a 2x1 wave remap helps a subset with
+        # N aligned to 2K tiles (4096/6144/8192) while avoiding N=7168 cases.
+        if (
+            M == 256
+            and N >= 4096
+            and N <= 8192
+            and N % 2048 == 0
+            and K >= 8192
+            and K <= 24576
+            and M % (WMMA_M * 4 * 2) == 0
+            and N % (WMMA_N * 4 * 1) == 0
+        ):
+            defaults.update(
+                {
+                    "waves_m": 2,
+                    "waves_n": 1,
+                }
+            )
+
+        # A small-M subset benefits from a 4x1 wave remap on top of pad16.
+        # Keep this narrow to avoid regressions on larger M / wider N tiles.
+        if (
+            M <= 512
+            and N <= 2048
+            and K >= 8192
+            and M % (WMMA_M * 4 * 4) == 0
+            and N % (WMMA_N * 4 * 1) == 0
+        ):
+            defaults.update(
+                {
+                    "waves_m": 4,
+                    "waves_n": 1,
+                    "group_m": 16,
+                }
+            )
+
+        # For very large-K medium/large tiles, increased K-padding reduces
+        # LDS conflicts with modest occupancy impact.
+        if (
+            M >= 2048
+            and N >= 8192
+            and K >= 24576
+        ):
+            defaults.update(
+                {
+                    "a_k_pad": 16,
+                    "b_k_pad": 16,
+                }
+            )
+
+        # For a recurring Strix long-K band (K=12288) with medium N, a
+        # 128x64 tile tends to reduce memory pressure and improves throughput.
+        if (
+            M >= 2048
+            and N >= 2048
+            and N <= 4096
+            and K == 12288
+            and M % (WMMA_M * 4 * 2) == 0
+            and N % (WMMA_N * 4 * 1) == 0
+        ):
+            defaults.update(
+                {
+                    "waves_m": 2,
+                    "waves_n": 1,
+                }
+            )
+
     reg_m = defaults["reg_m"] if reg_m is None else reg_m
     reg_n = defaults["reg_n"] if reg_n is None else reg_n
     reg_k = defaults["reg_k"] if reg_k is None else reg_k
