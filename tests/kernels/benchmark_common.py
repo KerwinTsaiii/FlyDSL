@@ -328,7 +328,7 @@ def run_wmma_sweep(
     warmup: int = 10,
     iters: int = 50,
 ) -> List[PerfRow]:
-    """Benchmark WMMA GEMM kernels (RDNA4 only) vs torch."""
+    """Benchmark RDNA WMMA GEMM kernels (gfx11/gfx12) vs torch."""
     import torch
 
     rows: List[PerfRow] = []
@@ -336,8 +336,9 @@ def run_wmma_sweep(
     from flydsl.runtime.device import get_rocm_arch
 
     arch = get_rocm_arch()
-    if not arch.startswith("gfx120"):
+    if not arch.startswith(("gfx120", "gfx115", "gfx110")):
         return rows
+    supports_fp8_wmma = arch.startswith("gfx120")
 
     fail_count = 0
 
@@ -362,35 +363,36 @@ def run_wmma_sweep(
             pass  # torch reference failure is non-fatal
         rows.append(PerfRow(op="wmma_gemm", shape=shape, dtype=dt, flydsl_gpu_us=flydsl_us, aiter_gpu_us=torch_us))
 
-    # wmma_fp8_gemm (A raw, B preshuffled)
-    for M, N, dt in _default_fp8_configs():
-        K = N
-        shape = f"{M}x{N}x{K}"
-        flydsl_us = None
-        torch_us = None
-        try:
-            flydsl_us = _bench_flydsl_torch(op="wmma_fp8_gemm", M=M, N=N, dtype="bf16", warmup=warmup, iters=iters)
-        except Exception as e:
-            print(f"ERROR: fp8_gemm {shape} FAILED: {e}")
-            fail_count += 1
-        try:
-            from kernels.rdna_fp8_preshuffle_gemm import fp8_quantize_per_token, fp8_quantize_per_channel
+    # wmma_fp8_gemm (A raw, B preshuffled) — RDNA4 only.
+    if supports_fp8_wmma:
+        for M, N, dt in _default_fp8_configs():
+            K = N
+            shape = f"{M}x{N}x{K}"
+            flydsl_us = None
+            torch_us = None
+            try:
+                flydsl_us = _bench_flydsl_torch(op="wmma_fp8_gemm", M=M, N=N, dtype="bf16", warmup=warmup, iters=iters)
+            except Exception as e:
+                print(f"ERROR: fp8_gemm {shape} FAILED: {e}")
+                fail_count += 1
+            try:
+                from kernels.rdna_fp8_preshuffle_gemm import fp8_quantize_per_token, fp8_quantize_per_channel
 
-            A_f32 = torch.randn(M, K, device="cuda") * 0.1
-            B_f32 = torch.randn(K, N, device="cuda") * 0.1
-            A_fp8, sa = fp8_quantize_per_token(A_f32)
-            B_fp8, sb = fp8_quantize_per_channel(B_f32)
-            B_col = B_fp8.T.contiguous().T
-            sa_t = sa.to(device="cuda", dtype=torch.float32).unsqueeze(1).contiguous()   # (M, 1)
-            sb_t = sb.to(device="cuda", dtype=torch.float32).unsqueeze(0).contiguous()   # (1, N)
-            torch_us = bench_gpu_us_torch(
-                lambda: torch._scaled_mm(A_fp8, B_col, scale_a=sa_t, scale_b=sb_t, out_dtype=torch.bfloat16),
-                warmup=warmup,
-                iters=iters,
-            )
-        except Exception:
-            pass  # torch reference failure is non-fatal
-        rows.append(PerfRow(op="fp8_gemm", shape=shape, dtype="fp8", flydsl_gpu_us=flydsl_us, aiter_gpu_us=torch_us))
+                A_f32 = torch.randn(M, K, device="cuda") * 0.1
+                B_f32 = torch.randn(K, N, device="cuda") * 0.1
+                A_fp8, sa = fp8_quantize_per_token(A_f32)
+                B_fp8, sb = fp8_quantize_per_channel(B_f32)
+                B_col = B_fp8.T.contiguous().T
+                sa_t = sa.to(device="cuda", dtype=torch.float32).unsqueeze(1).contiguous()   # (M, 1)
+                sb_t = sb.to(device="cuda", dtype=torch.float32).unsqueeze(0).contiguous()   # (1, N)
+                torch_us = bench_gpu_us_torch(
+                    lambda: torch._scaled_mm(A_fp8, B_col, scale_a=sa_t, scale_b=sb_t, out_dtype=torch.bfloat16),
+                    warmup=warmup,
+                    iters=iters,
+                )
+            except Exception:
+                pass  # torch reference failure is non-fatal
+            rows.append(PerfRow(op="fp8_gemm", shape=shape, dtype="fp8", flydsl_gpu_us=flydsl_us, aiter_gpu_us=torch_us))
 
     if fail_count > 0:
         raise RuntimeError(f"{fail_count} RDNA WMMA benchmark(s) failed — see errors above")
@@ -851,11 +853,11 @@ def main() -> None:
     rows = run_compare_sweep(configs=configs, aiter_impl=aiter_impl, warmup=warmup, iters=iters)
     print_perf_table(rows)
 
-    # WMMA GEMM benchmarks (RDNA4 only)
+    # WMMA GEMM benchmarks (RDNA wave32: gfx11/gfx12; fp8 on gfx12 only)
     wmma_rows = run_wmma_sweep(warmup=warmup, iters=iters)
     if wmma_rows:
         print("\n" + "=" * 100)
-        print("Perf Compare (gpu us): FlyDSL WMMA vs torch (RDNA4)")
+        print("Perf Compare (gpu us): FlyDSL WMMA vs torch (RDNA wave32)")
         print("=" * 100)
         print(f"{'op':10s} {'shape':18s} {'dtype':6s} {'FlyDSL(gpu us)':>14s} {'torch(gpu us)':>14s} {'speedup':>10s}")
         for r in wmma_rows:

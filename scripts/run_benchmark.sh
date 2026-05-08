@@ -45,9 +45,13 @@ fi
 GPU_ARCH=$(python3 -c "from flydsl.runtime.device import get_rocm_arch; print(get_rocm_arch())" 2>/dev/null || echo "unknown")
 IS_CDNA=false
 IS_RDNA4=false
+IS_RDNA_WMMA=false
 case "${GPU_ARCH}" in gfx9*) IS_CDNA=true ;; esac
 case "${GPU_ARCH}" in gfx120*) IS_RDNA4=true ;; esac
-echo "[run_benchmark] GPU arch: ${GPU_ARCH} (CDNA=${IS_CDNA}, RDNA4=${IS_RDNA4})"
+case "${GPU_ARCH}" in
+  gfx120*|gfx115*|gfx110*) IS_RDNA_WMMA=true ;;
+esac
+echo "[run_benchmark] GPU arch: ${GPU_ARCH} (CDNA=${IS_CDNA}, RDNA4=${IS_RDNA4}, RDNA_WMMA=${IS_RDNA_WMMA})"
 
 SUCCESS_COUNT=0
 FAIL_COUNT=0
@@ -164,7 +168,7 @@ Usage:
   bash scripts/run_benchmark.sh --list
 
 Supported ops:
-  softmax | layernorm | rmsnorm | gemm | moe
+  softmax | layernorm | rmsnorm | gemm | moe | fusion
 USAGE
 }
 
@@ -222,13 +226,14 @@ _normalize_op() {
   esac
 }
 
-# Default: run softmax, norms, and GEMM unless user selected a subset.
-# Use positional args or --only to enable others: softmax, layernorm, rmsnorm, gemm, moe
+# Default: run softmax, norms, GEMM, and MoE unless user selected a subset.
+# Fusion benchmark is opt-in (run with --only fusion or positional "fusion").
 RUN_SOFTMAX=1
 RUN_LAYERNORM=1
 RUN_RMSNORM=1
 RUN_PRESHUFFLE_GEMM=1
 RUN_MOE=1
+RUN_FUSION=0
 
 _enable_only_ops() {
   RUN_SOFTMAX=0
@@ -236,6 +241,7 @@ _enable_only_ops() {
   RUN_RMSNORM=0
   RUN_PRESHUFFLE_GEMM=0
   RUN_MOE=0
+  RUN_FUSION=0
   for op in "$@"; do
     op="$(_normalize_op "${op}")"
     case "${op}" in
@@ -244,6 +250,7 @@ _enable_only_ops() {
       rmsnorm) RUN_RMSNORM=1 ;;
       gemm) RUN_PRESHUFFLE_GEMM=1 ;;
       moe) RUN_MOE=1 ;;
+      fusion) RUN_FUSION=1 ;;
       "" ) ;;
       *) _die "unknown op '${op}'" ;;
     esac
@@ -280,6 +287,7 @@ if [ "$#" -gt 0 ]; then
         echo "rmsnorm"
         echo "gemm"
         echo "moe"
+        echo "fusion"
         exit 0
         ;;
       --only)
@@ -892,11 +900,12 @@ if [ "${RUN_MOE}" -eq 1 ] && [ "${IS_CDNA}" = "true" ]; then
   done
 fi
 
-# RDNA4 WMMA GEMM benchmarks (via benchmark_common.py)
-if [ "${IS_RDNA4}" = "true" ]; then
+# RDNA WMMA GEMM benchmarks (gfx11/gfx12, via benchmark_common.py)
+# Bind this to the "gemm" op switch for consistency with CLI selection.
+if [ "${RUN_PRESHUFFLE_GEMM}" -eq 1 ] && [ "${IS_RDNA_WMMA}" = "true" ]; then
   echo ""
   echo "========================================================================"
-  echo "RDNA4 WMMA Benchmarks"
+  echo "RDNA WMMA Benchmarks"
   echo "========================================================================"
   log="${BENCH_LOG_DIR}/rdna_wmma_sweep.log"
   if python3 -c "from tests.kernels.benchmark_common import run_wmma_sweep, print_perf_table; rows = run_wmma_sweep(); print_perf_table(rows)" >"${log}" 2>&1; then
@@ -904,8 +913,30 @@ if [ "${IS_RDNA4}" = "true" ]; then
     SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
   else
     FAIL_COUNT=$((FAIL_COUNT + 1))
-    echo "RDNA4 WMMA benchmark failed. Log: ${log}" >&2
+    echo "RDNA WMMA benchmark failed. Log: ${log}" >&2
     tail -20 "${log}" >&2
+  fi
+fi
+
+# Strix fusion-first benchmarks (opt-in via "fusion" op).
+# Policy: keep known-gaps as script-level "skip" rows; only hard failures fail this step.
+if [ "${RUN_FUSION}" -eq 1 ]; then
+  if [ "${IS_RDNA_WMMA}" != "true" ]; then
+    echo "[run_benchmark] fusion skipped: requires RDNA WMMA arch (gfx11x/gfx12x), got ${GPU_ARCH}"
+  else
+    echo ""
+    echo "========================================================================"
+    echo "Strix Fusion Benchmarks"
+    echo "========================================================================"
+    log="${BENCH_LOG_DIR}/strix_fusion.log"
+    if bash scripts/bench_strixhalo_fusion.sh >"${log}" 2>&1; then
+      cat "${log}"
+      SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    else
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+      echo "Strix fusion benchmark failed. Log: ${log}" >&2
+      tail -20 "${log}" >&2
+    fi
   fi
 fi
 

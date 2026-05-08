@@ -36,25 +36,22 @@ WMMA_N = 16
 WMMA_K = 16
 
 
-def create_wmma_gemm_module(
+def resolve_wmma_gemm_config(
     M: int,
     N: int,
     K: int,
-    in_dtype="bf16",
-    out_dtype="bf16",
+    gpu_arch: str,
     *,
-    reg_m=None,  # M-repeats per warp
-    reg_n=None,  # N-repeats per warp
-    reg_k=None,  # K-steps per tile (32/16=2)
-    waves_m=None,  # warps in M dimension
-    waves_n=None,  # warps in N dimension
+    reg_m=None,
+    reg_n=None,
+    reg_k=None,
+    waves_m=None,
+    waves_n=None,
     group_m=None,
-    a_k_pad=None,  # K-padding for A in LDS (bank conflict avoidance)
-    b_k_pad=None,  # K-padding for B in LDS
-    use_native_bf16_acc=False,  # Experimental path; disabled by default.
+    a_k_pad=None,
+    b_k_pad=None,
 ):
-    gpu_arch = get_rocm_arch()
-
+    """Resolve tile/wave/padding config for WMMA GEMM shape on a target arch."""
     # Generic fallback keeps existing behavior.
     defaults = {
         "reg_m": 4,
@@ -97,6 +94,21 @@ def create_wmma_gemm_module(
                 }
             )
 
+        # Medium square tiles on Strix (512~2048) with modest K are typically
+        # LDS-sensitive; extra K-padding improves stability and throughput.
+        if (
+            M >= 512
+            and M <= 2048
+            and N == K
+            and K <= 4096
+        ):
+            defaults.update(
+                {
+                    "a_k_pad": 16,
+                    "b_k_pad": 16,
+                }
+            )
+
         # Long-K, narrow-to-mid N shapes are a frequent weak spot versus
         # hipBLASLt on Strix Halo (e.g. 2048x3072x12288, 1024x4096x16384).
         # Increasing K-padding is the most robust gain across this family.
@@ -121,6 +133,38 @@ def create_wmma_gemm_module(
             and N >= 4096
             and K >= 4096
             and K <= 28672
+        ):
+            defaults.update(
+                {
+                    "a_k_pad": 16,
+                    "b_k_pad": 16,
+                }
+            )
+
+        # A broad M=256 family benefits from 4x1 waves, but two sub-families
+        # are consistently regression-prone: N=3072 and K=3N long-K stripes.
+        if (
+            M == 256
+            and N != 3072
+            and K != (3 * N)
+            and M % (WMMA_M * 4 * 4) == 0
+            and N % (WMMA_N * 4 * 1) == 0
+        ):
+            defaults.update(
+                {
+                    "waves_m": 4,
+                    "waves_n": 1,
+                    "group_m": 16,
+                }
+            )
+
+        # M=128 tends to underperform on elongated tiles. For non-square
+        # medium/large N/K regions, increasing K-padding is usually a win
+        # while avoiding equal-NK tiles that are more sensitivity-prone.
+        if (
+            M == 128
+            and (N >= 8192 or K >= 16384)
+            and N != K
         ):
             defaults.update(
                 {
@@ -196,14 +240,58 @@ def create_wmma_gemm_module(
                 }
             )
 
-    reg_m = defaults["reg_m"] if reg_m is None else reg_m
-    reg_n = defaults["reg_n"] if reg_n is None else reg_n
-    reg_k = defaults["reg_k"] if reg_k is None else reg_k
-    waves_m = defaults["waves_m"] if waves_m is None else waves_m
-    waves_n = defaults["waves_n"] if waves_n is None else waves_n
-    group_m = defaults["group_m"] if group_m is None else group_m
-    a_k_pad = defaults["a_k_pad"] if a_k_pad is None else a_k_pad
-    b_k_pad = defaults["b_k_pad"] if b_k_pad is None else b_k_pad
+    return {
+        "reg_m": defaults["reg_m"] if reg_m is None else reg_m,
+        "reg_n": defaults["reg_n"] if reg_n is None else reg_n,
+        "reg_k": defaults["reg_k"] if reg_k is None else reg_k,
+        "waves_m": defaults["waves_m"] if waves_m is None else waves_m,
+        "waves_n": defaults["waves_n"] if waves_n is None else waves_n,
+        "group_m": defaults["group_m"] if group_m is None else group_m,
+        "a_k_pad": defaults["a_k_pad"] if a_k_pad is None else a_k_pad,
+        "b_k_pad": defaults["b_k_pad"] if b_k_pad is None else b_k_pad,
+    }
+
+
+def create_wmma_gemm_module(
+    M: int,
+    N: int,
+    K: int,
+    in_dtype="bf16",
+    out_dtype="bf16",
+    *,
+    reg_m=None,  # M-repeats per warp
+    reg_n=None,  # N-repeats per warp
+    reg_k=None,  # K-steps per tile (32/16=2)
+    waves_m=None,  # warps in M dimension
+    waves_n=None,  # warps in N dimension
+    group_m=None,
+    a_k_pad=None,  # K-padding for A in LDS (bank conflict avoidance)
+    b_k_pad=None,  # K-padding for B in LDS
+    use_native_bf16_acc=False,  # Experimental path; disabled by default.
+):
+    gpu_arch = get_rocm_arch()
+    config = resolve_wmma_gemm_config(
+        M,
+        N,
+        K,
+        gpu_arch,
+        reg_m=reg_m,
+        reg_n=reg_n,
+        reg_k=reg_k,
+        waves_m=waves_m,
+        waves_n=waves_n,
+        group_m=group_m,
+        a_k_pad=a_k_pad,
+        b_k_pad=b_k_pad,
+    )
+    reg_m = config["reg_m"]
+    reg_n = config["reg_n"]
+    reg_k = config["reg_k"]
+    waves_m = config["waves_m"]
+    waves_n = config["waves_n"]
+    group_m = config["group_m"]
+    a_k_pad = config["a_k_pad"]
+    b_k_pad = config["b_k_pad"]
 
     BLOCK_M = WMMA_M * reg_m * waves_m  # 16*4*2 = 128
     BLOCK_N = WMMA_N * reg_n * waves_n  # 16*4*2 = 128

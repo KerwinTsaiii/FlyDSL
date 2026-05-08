@@ -12,6 +12,7 @@ LLVM_BUILD_DIR="$LLVM_SRC_DIR/build-flydsl"
 LLVM_INSTALL_DIR="${LLVM_INSTALL_DIR:-$LLVM_SRC_DIR/mlir_install}"
 LLVM_INSTALL_TGZ="${LLVM_INSTALL_TGZ:-$LLVM_SRC_DIR/mlir_install.tgz}"
 LLVM_PACKAGE_INSTALL="${LLVM_PACKAGE_INSTALL:-1}"
+PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE:-python3}"
 
 # Read LLVM commit hash from thirdparty/llvm-hash.txt
 LLVM_HASH_FILE="${REPO_ROOT}/thirdparty/llvm-hash.txt"
@@ -59,7 +60,39 @@ echo "Configuring LLVM..."
 
 # Install dependencies for Python bindings
 echo "Installing Python dependencies..."
-pip install nanobind numpy pybind11
+if ! command -v "${PYTHON_EXECUTABLE}" >/dev/null 2>&1; then
+    echo "Error: Python executable not found: ${PYTHON_EXECUTABLE}" >&2
+    exit 1
+fi
+PYTHON_EXECUTABLE_PATH="$(command -v "${PYTHON_EXECUTABLE}")"
+"${PYTHON_EXECUTABLE_PATH}" -m pip install nanobind numpy pybind11
+PYTHON_CONFIG="${PYTHON_EXECUTABLE_PATH}-config"
+PYTHON_EMBED_LDFLAGS=""
+if [[ -x "${PYTHON_CONFIG}" ]]; then
+    PYTHON_EMBED_LDFLAGS="$("${PYTHON_CONFIG}" --embed --ldflags 2>/dev/null || "${PYTHON_CONFIG}" --ldflags 2>/dev/null || true)"
+fi
+
+if [[ -z "${PYTHON_EMBED_LDFLAGS}" ]]; then
+    PYTHON_LINK_FLAGS="$("${PYTHON_EXECUTABLE_PATH}" - <<'PY'
+import sys
+import sysconfig
+
+libdir = sysconfig.get_config_var("LIBDIR") or ""
+ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+flags = []
+if libdir:
+    flags.append(f"-L{libdir}")
+flags.append(f"-lpython{ver}")
+print(" ".join(flags))
+PY
+)"
+else
+    PYTHON_LINK_FLAGS="${PYTHON_EMBED_LDFLAGS}"
+fi
+
+# LLVM forces -Wl,-z,defs on Linux shared libraries; explicitly link libpython
+# so MLIR's nanobind shared library resolves Python C-API symbols.
+PYTHON_SHARED_LINKER_FLAGS="-Wl,--no-as-needed ${PYTHON_LINK_FLAGS} -Wl,--as-needed"
 
 # Check for ninja
 GENERATOR="Unix Makefiles"
@@ -72,7 +105,7 @@ fi
 
 # Build only MLIR and necessary Clang tools, targeting native architecture, in Release mode
 # Explicitly set nanobind directory if found to help CMake locate it
-NANOBIND_DIR=$(python3 -c "import nanobind; import os; print(os.path.dirname(nanobind.__file__) + '/cmake')")
+NANOBIND_DIR=$("${PYTHON_EXECUTABLE_PATH}" -c "import nanobind; import os; print(os.path.dirname(nanobind.__file__) + '/cmake')")
 
 cmake -G "$GENERATOR" \
     -S "$LLVM_SRC_DIR/llvm" \
@@ -86,13 +119,14 @@ cmake -G "$GENERATOR" \
     -DLLVM_INSTALL_UTILS=ON \
     -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
     -DMLIR_BINDINGS_PYTHON_NB_DOMAIN=mlir \
-    -DPython3_EXECUTABLE=$(which python3) \
+    -DPython3_EXECUTABLE="${PYTHON_EXECUTABLE_PATH}" \
     -Dnanobind_DIR="$NANOBIND_DIR" \
     -DBUILD_SHARED_LIBS=OFF \
     -DLLVM_BUILD_LLVM_DYLIB=OFF \
     -DLLVM_LINK_LLVM_DYLIB=OFF \
     -DMLIR_INCLUDE_TESTS=OFF \
-    -DCMAKE_INSTALL_RPATH="\$ORIGIN"
+    -DCMAKE_INSTALL_RPATH="\$ORIGIN" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${PYTHON_SHARED_LINKER_FLAGS}"
 
 # 4. Build
 PARALLEL_JOBS=$(( $(nproc) / 2 ))
