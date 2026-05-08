@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RDNA4 GEMM correctness tests (gfx120x, wave32).
+"""RDNA WMMA GEMM correctness tests (gfx110x/gfx115x/gfx120x, wave32).
 
 Kernel implementations:
   kernels/rdna_f16_gemm.py          — BF16/F16 GEMM with LDS
@@ -37,7 +37,7 @@ if not torch.cuda.is_available():
 ARCH = str(get_rocm_arch())
 
 
-def _requires_rdna4():
+def _requires_rdna_wmma():
     # The kernel is named "rdna4 / WMMA wave32" but its raw `wmma_*_16x16x16_*`
     # F16 / BF16 intrinsics are valid on every wave32 + WMMA chip — that
     # includes RDNA 3 (gfx110x) and RDNA 3.5 (gfx115x, e.g. Strix Point
@@ -84,7 +84,7 @@ def _requires_fp8_wmma():
 @pytest.mark.parametrize("dtype", ["bf16", "f16"])
 def test_f16_gemm_correctness(M, N, K, dtype):
     """Test BF16/F16 GEMM correctness for various shapes and dtypes."""
-    _requires_rdna4()
+    _requires_rdna_wmma()
 
     torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
     torch.manual_seed(42)
@@ -111,7 +111,7 @@ def test_f16_gemm_correctness(M, N, K, dtype):
 )
 def test_f16_gemm_f32_output(M, N, K):
     """Test BF16 GEMM with f32 output accumulation."""
-    _requires_rdna4()
+    _requires_rdna_wmma()
 
     torch.manual_seed(42)
     launch_fn, _, _, _ = create_wmma_gemm_module(M, N, K, in_dtype="bf16", out_dtype="f32")
@@ -136,7 +136,7 @@ def test_f16_gemm_f32_output(M, N, K):
 )
 def test_f16_gemm_benchmark(M, N, K):
     """Benchmark BF16 GEMM throughput."""
-    _requires_rdna4()
+    _requires_rdna_wmma()
 
     torch.manual_seed(42)
     launch_fn, _, _, _ = create_wmma_gemm_module(M, N, K, in_dtype="bf16", out_dtype="bf16")
@@ -206,7 +206,7 @@ def test_fp8_gemm_correctness(M, N, K):
 
 def test_fp8_preshuffle_b():
     """Test preshuffle_b_fp8 produces correct layout."""
-    _requires_rdna4()
+    _requires_rdna_wmma()
 
     K, N = 64, 32
     B = torch.arange(K * N, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn).reshape(K, N)
@@ -216,7 +216,7 @@ def test_fp8_preshuffle_b():
 
 def test_fp8_quantize():
     """Test fp8_quantize_per_token roundtrip."""
-    _requires_rdna4()
+    _requires_rdna_wmma()
 
     x = torch.randn(64, 64, device="cuda")
     x_fp8, scale = fp8_quantize_per_token(x)

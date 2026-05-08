@@ -2,7 +2,8 @@
 
 Automatically skips tests that are incompatible with the current GPU:
   - MFMA-based kernels (preshuffle GEMM, MoE, blockscale, PA) require CDNA (gfx9xx)
-  - WMMA-based kernels require RDNA4 (gfx12xx) — handled by per-test _requires_rdna4()
+  - WMMA-based kernels are guarded per-test for RDNA wave32 targets
+    (gfx110x/gfx115x/gfx120x)
   - Generic kernels (softmax, layernorm, vec_add, quant, etc.) run on all architectures
 
 Configuration lives in tests/arch_compat.py (single source of truth).
